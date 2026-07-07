@@ -829,10 +829,10 @@ def _(go, make_subplots):
         fig = make_subplots(
             rows=2, cols=3,
             specs=[[{"type": "xy"}, {"type": "scene", "rowspan": 2}, {"type": "xy"}],
-                   [{"type": "xy"}, None, None]],
+                   [{"type": "xy"}, None, {"type": "xy"}]],
             column_widths=[0.24, 0.52, 0.24], row_heights=[0.5, 0.5],
             subplot_titles=("reasoning trace", "", "Q-value distribution",
-                             "correct-cells distribution"),
+                             "correct-cells distribution", "Q value over time"),
         )
 
         fig.add_trace(go.Heatmap(
@@ -873,6 +873,26 @@ def _(go, make_subplots):
             autobinx=False, marker=dict(color="#f08c00"), showlegend=False,
         ), row=2, col=1)
 
+        # --- Static (non-animated) summary: Q value over time, solved vs unsolved rollouts.
+        # Drawn once, outside the frame loop, so it doesn't move as you scrub through steps. ---
+        _steps_x = list(range(1, n_steps + 1))
+        for _roll_q, _color, _fill, _name in (
+            (roll_q_success, "#2f9e44", "rgba(47,158,68,0.15)", "solved"),
+            (roll_q_fail, "#e03131", "rgba(224,49,49,0.15)", "unsolved"),
+        ):
+            if _roll_q.shape[0] == 0:
+                continue
+            _qmin, _qmax, _qmean = _roll_q.min(0), _roll_q.max(0), _roll_q.mean(0)
+            fig.add_trace(go.Scatter(
+                x=_steps_x + _steps_x[::-1], y=list(_qmax) + list(_qmin[::-1]),
+                mode="lines", fill="toself", fillcolor=_fill, line=dict(width=0),
+                showlegend=False, hoverinfo="skip",
+            ), row=2, col=3)
+            fig.add_trace(go.Scatter(
+                x=_steps_x, y=list(_qmean), mode="lines+markers",
+                line=dict(color=_color, width=3), marker=dict(size=5, color=_color), name=_name,
+            ), row=2, col=3)
+
         frames = []
         for t in range(n_steps):
             frame_data = [go.Heatmap(z=grid_zs[t], text=grid_texts[t])]
@@ -905,6 +925,10 @@ def _(go, make_subplots):
         fig.update_xaxes(title_text="# correct cells (of 81)", range=[corr_range[0] - 0.5, corr_range[1] + 0.5],
                           row=2, col=1)
         fig.update_yaxes(title_text="# rollouts", row=2, col=1)
+        fig.update_xaxes(title_text="step", showgrid=False, showline=True, linecolor="black",
+                          mirror=True, row=2, col=3)
+        fig.update_yaxes(title_text="Q logit", showgrid=False, showline=True, linecolor="black",
+                          mirror=True, row=2, col=3)
         fig.update_layout(
             title=title, height=640,
             barmode="stack",
