@@ -813,17 +813,27 @@ def _(SUDOKU_TRAP_EXAMPLES, mo):
 
 @app.cell(hide_code=True)
 def _(go, make_subplots):
-    # --- Same two-subplot layout as the trap figure, but with many PTRM trajectories (colored by
-    # success) plus one black deterministic TRM trajectory, all sharing one Play/Pause + slider. ---
-    def make_ptrm_explorer_figure(grid_zs, grid_texts, box_lines, det_xyz, rollouts, title,
+    # --- Grid | 3D scene (rowspan 2) | Q-value distribution, with a correct-cells distribution
+    # underneath the grid -- all four panels animate together off ONE shared Play/Pause + slider. ---
+    def make_ptrm_explorer_figure(grid_zs, grid_texts, box_lines, det_xyz, rollouts,
+                                   roll_q_success, roll_q_fail, roll_correct_all, q_range, title,
                                    xy_range, z_range, surface_x, surface_y, surface_z,
                                    surface_density, z_label, frame_labels):
         xs_d, ys_d, zs_d = det_xyz
         n_steps = len(xs_d)
         n_roll = len(rollouts)
+        corr_range = (float(z_range[0]), float(z_range[1]))
+        q_bins = 24
+        q_bin_size = max((q_range[1] - q_range[0]) / q_bins, 1e-6)
 
-        fig = make_subplots(rows=1, cols=2, specs=[[{"type": "xy"}, {"type": "scene"}]],
-                             column_widths=[0.42, 0.58])
+        fig = make_subplots(
+            rows=2, cols=3,
+            specs=[[{"type": "xy"}, {"type": "scene", "rowspan": 2}, {"type": "xy"}],
+                   [{"type": "xy"}, None, None]],
+            column_widths=[0.24, 0.52, 0.24], row_heights=[0.5, 0.5],
+            subplot_titles=("reasoning trace", "", "Q-value distribution",
+                             "correct-cells distribution"),
+        )
 
         fig.add_trace(go.Heatmap(
             z=grid_zs[0], text=grid_texts[0], texttemplate="%{text}", textfont=dict(size=14),
@@ -847,6 +857,21 @@ def _(go, make_subplots):
         fig.add_trace(go.Scatter3d(x=[xs_d[0]], y=[ys_d[0]], z=[zs_d[0]], mode="markers",
                                     marker=dict(size=7, color="black"), showlegend=False,
                                     hoverinfo="skip"), row=1, col=2)
+        _q_success_idx = 4 + n_roll
+        _q_fail_idx = 5 + n_roll
+        _corr_hist_idx = 6 + n_roll
+        fig.add_trace(go.Histogram(
+            x=roll_q_success[:, 0], xbins=dict(start=q_range[0], end=q_range[1], size=q_bin_size),
+            autobinx=False, marker=dict(color="#2f9e44"), name="solved", showlegend=False,
+        ), row=1, col=3)
+        fig.add_trace(go.Histogram(
+            x=roll_q_fail[:, 0], xbins=dict(start=q_range[0], end=q_range[1], size=q_bin_size),
+            autobinx=False, marker=dict(color="#e03131"), name="unsolved", showlegend=False,
+        ), row=1, col=3)
+        fig.add_trace(go.Histogram(
+            x=roll_correct_all[:, 0], xbins=dict(start=corr_range[0] - 0.5, end=corr_range[1] + 0.5, size=1),
+            autobinx=False, marker=dict(color="#f08c00"), showlegend=False,
+        ), row=2, col=1)
 
         frames = []
         for t in range(n_steps):
@@ -859,18 +884,30 @@ def _(go, make_subplots):
             traces.append(2 + n_roll)
             frame_data.append(go.Scatter3d(x=[xs_d[t]], y=[ys_d[t]], z=[zs_d[t]]))
             traces.append(3 + n_roll)
+            frame_data.append(go.Histogram(x=roll_q_success[:, t]))
+            traces.append(_q_success_idx)
+            frame_data.append(go.Histogram(x=roll_q_fail[:, t]))
+            traces.append(_q_fail_idx)
+            frame_data.append(go.Histogram(x=roll_correct_all[:, t]))
+            traces.append(_corr_hist_idx)
             frames.append(go.Frame(
                 data=frame_data, traces=traces, name=str(t),
-                layout=go.Layout(annotations=[dict(text=frame_labels[t], showarrow=False, x=0.78,
-                                                    y=1.12, xref="paper", yref="paper",
+                layout=go.Layout(annotations=[dict(text=frame_labels[t], showarrow=False, x=0.5,
+                                                    y=1.08, xref="paper", yref="paper",
                                                     font=dict(size=14))]),
             ))
         fig.frames = frames
 
         fig.update_xaxes(visible=False, row=1, col=1)
         fig.update_yaxes(visible=False, autorange="reversed", row=1, col=1)
+        fig.update_xaxes(title_text="Q logit", range=list(q_range), row=1, col=3)
+        fig.update_yaxes(title_text="# rollouts", row=1, col=3)
+        fig.update_xaxes(title_text="# correct cells (of 81)", range=[corr_range[0] - 0.5, corr_range[1] + 0.5],
+                          row=2, col=1)
+        fig.update_yaxes(title_text="# rollouts", row=2, col=1)
         fig.update_layout(
-            title=title, height=460,
+            title=title, height=640,
+            barmode="stack",
             shapes=box_lines,
             scene=dict(
                 xaxis=dict(title="PC1", range=list(xy_range[0])),
@@ -878,10 +915,10 @@ def _(go, make_subplots):
                 zaxis=dict(title=z_label, range=list(z_range)),
             ),
             margin=dict(l=0, r=0, t=60, b=80),
-            annotations=[dict(text=frame_labels[0], showarrow=False, x=0.78, y=1.12,
+            annotations=[dict(text=frame_labels[0], showarrow=False, x=0.5, y=1.08,
                               xref="paper", yref="paper", font=dict(size=16))],
             updatemenus=[dict(
-                type="buttons", showactive=False, x=0.05, y=-0.12, xanchor="left", yanchor="top",
+                type="buttons", showactive=False, x=0.05, y=-0.1, xanchor="left", yanchor="top",
                 buttons=[
                     dict(label="▶ Play", method="animate",
                          args=[None, dict(frame=dict(duration=700, redraw=True),
@@ -892,7 +929,7 @@ def _(go, make_subplots):
                 ],
             )],
             sliders=[dict(
-                x=0.2, y=-0.12, len=0.75,
+                x=0.2, y=-0.1, len=0.75,
                 steps=[dict(method="animate", label=f"step {t + 1}",
                             args=[[str(t)], dict(mode="immediate", frame=dict(duration=0, redraw=True))])
                        for t in range(n_steps)],
@@ -958,6 +995,15 @@ def ptrm_explorer_display(
         _roll_xy.reshape(-1, 2), _roll_zs.reshape(-1), _xy_range[0], _xy_range[1],
     )
 
+    # --- Q-value range for the distribution histogram, fixed across frames so bins don't jump ---
+    _q_pad = 0.05 * max(np.ptp(_roll_q_step), 1e-6)
+    _q_range = (float(_roll_q_step.min() - _q_pad), float(_roll_q_step.max() + _q_pad))
+
+    # --- Split Q-values by each rollout's FINAL outcome, so the histogram bars stack green
+    # (pathways that end up correct) on top of red (pathways that end up wrong) ---
+    _roll_q_success = _roll_q_step[_roll_success]      # [Ksucc, T]
+    _roll_q_fail = _roll_q_step[~_roll_success]        # [Kfail, T]
+
     # --- Subsample rollouts for plotting so the scene stays readable at high K; the KDE surface
     # and the per-step "best" grid above still use every rollout, only the drawn lines are capped ---
     _MAX_LINES = 30
@@ -989,6 +1035,7 @@ def ptrm_explorer_display(
     _n_success = int(_roll_success.sum())
     make_ptrm_explorer_figure(
         _grid_zs, _grid_texts, _box_lines, (_det_xs, _det_ys, _det_zs), _rollouts_for_plot,
+        _roll_q_success, _roll_q_fail, _roll_correct, _q_range,
         f"{ptrm_puzzle_choice.value} — sigma={_sigma:.2f}, K={_K} ({_n_success}/{_K} rollouts solved)",
         _xy_range, _z_range, _gxx, _gyy, _zsurf, _density, "# correct cells (of 81)", _frame_labels,
     )
