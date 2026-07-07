@@ -785,6 +785,217 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Try it yourself: PTRM rollout explorer
+
+    Pick one of the same stuck puzzles from above, then adjust sigma (noise added to z_L at every
+    step) and K (number of parallel rollouts). The TRM's deterministic path is drawn in **black**;
+    each PTRM rollout is **green** if it lands on the exact solution and **red** if it doesn't. The
+    grid on the left tracks the single best rollout *at each time step*, chosen by Q-head value —
+    watch which rollout the Q head trusts most as reasoning unfolds.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(SUDOKU_TRAP_EXAMPLES, mo):
+    ptrm_puzzle_choice = mo.ui.dropdown(
+        options=list(SUDOKU_TRAP_EXAMPLES.keys()),
+        value=next(iter(SUDOKU_TRAP_EXAMPLES)),
+        label="Choose a stuck puzzle",
+    )
+    ptrm_sigma_slider = mo.ui.slider(0.0, 0.5, value=0.15, step=0.01, label="sigma (noise)")
+    ptrm_k_slider = mo.ui.slider(8, 128, value=64, step=8, label="K (rollouts)")
+    mo.hstack([ptrm_puzzle_choice, ptrm_sigma_slider, ptrm_k_slider])
+    return ptrm_k_slider, ptrm_puzzle_choice, ptrm_sigma_slider
+
+
+@app.cell(hide_code=True)
+def _(go, make_subplots):
+    # --- Same two-subplot layout as the trap figure, but with many PTRM trajectories (colored by
+    # success) plus one black deterministic TRM trajectory, all sharing one Play/Pause + slider. ---
+    def make_ptrm_explorer_figure(grid_zs, grid_texts, box_lines, det_xyz, rollouts, title,
+                                   xy_range, z_range, surface_x, surface_y, surface_z,
+                                   surface_density, z_label, frame_labels):
+        xs_d, ys_d, zs_d = det_xyz
+        n_steps = len(xs_d)
+        n_roll = len(rollouts)
+
+        fig = make_subplots(rows=1, cols=2, specs=[[{"type": "xy"}, {"type": "scene"}]],
+                             column_widths=[0.42, 0.58])
+
+        fig.add_trace(go.Heatmap(
+            z=grid_zs[0], text=grid_texts[0], texttemplate="%{text}", textfont=dict(size=14),
+            colorscale=[[0, "#e03131"], [1, "#2f9e44"]], zmin=0, zmax=1,
+            showscale=False, xgap=2, ygap=2,
+        ), row=1, col=1)
+        fig.add_trace(go.Surface(
+            x=surface_x, y=surface_y, z=surface_z, surfacecolor=surface_density,
+            colorscale="Blues", opacity=0.55, showscale=False,
+            contours=dict(z=dict(show=True, usecolormap=True, project=dict(z=True))),
+        ), row=1, col=2)
+        for (xs_k, ys_k, zs_k, ok) in rollouts:
+            fig.add_trace(go.Scatter3d(
+                x=[xs_k[0]], y=[ys_k[0]], z=[zs_k[0]], mode="lines",
+                line=dict(color="#2f9e44" if ok else "#e03131", width=3), opacity=0.55,
+                showlegend=False, hoverinfo="skip",
+            ), row=1, col=2)
+        fig.add_trace(go.Scatter3d(x=[xs_d[0]], y=[ys_d[0]], z=[zs_d[0]], mode="lines",
+                                    line=dict(color="black", width=7), showlegend=False,
+                                    hoverinfo="skip"), row=1, col=2)
+        fig.add_trace(go.Scatter3d(x=[xs_d[0]], y=[ys_d[0]], z=[zs_d[0]], mode="markers",
+                                    marker=dict(size=7, color="black"), showlegend=False,
+                                    hoverinfo="skip"), row=1, col=2)
+
+        frames = []
+        for t in range(n_steps):
+            frame_data = [go.Heatmap(z=grid_zs[t], text=grid_texts[t])]
+            traces = [0]
+            for ri, (xs_k, ys_k, zs_k, _ok) in enumerate(rollouts):
+                frame_data.append(go.Scatter3d(x=xs_k[:t + 1], y=ys_k[:t + 1], z=zs_k[:t + 1]))
+                traces.append(2 + ri)
+            frame_data.append(go.Scatter3d(x=xs_d[:t + 1], y=ys_d[:t + 1], z=zs_d[:t + 1]))
+            traces.append(2 + n_roll)
+            frame_data.append(go.Scatter3d(x=[xs_d[t]], y=[ys_d[t]], z=[zs_d[t]]))
+            traces.append(3 + n_roll)
+            frames.append(go.Frame(
+                data=frame_data, traces=traces, name=str(t),
+                layout=go.Layout(annotations=[dict(text=frame_labels[t], showarrow=False, x=0.78,
+                                                    y=1.12, xref="paper", yref="paper",
+                                                    font=dict(size=14))]),
+            ))
+        fig.frames = frames
+
+        fig.update_xaxes(visible=False, row=1, col=1)
+        fig.update_yaxes(visible=False, autorange="reversed", row=1, col=1)
+        fig.update_layout(
+            title=title, height=460,
+            shapes=box_lines,
+            scene=dict(
+                xaxis=dict(title="PC1", range=list(xy_range[0])),
+                yaxis=dict(title="PC2", range=list(xy_range[1])),
+                zaxis=dict(title=z_label, range=list(z_range)),
+            ),
+            margin=dict(l=0, r=0, t=60, b=80),
+            annotations=[dict(text=frame_labels[0], showarrow=False, x=0.78, y=1.12,
+                              xref="paper", yref="paper", font=dict(size=16))],
+            updatemenus=[dict(
+                type="buttons", showactive=False, x=0.05, y=-0.12, xanchor="left", yanchor="top",
+                buttons=[
+                    dict(label="▶ Play", method="animate",
+                         args=[None, dict(frame=dict(duration=700, redraw=True),
+                                          transition=dict(duration=300, easing="cubic-in-out"),
+                                          fromcurrent=True)]),
+                    dict(label="⏸ Pause", method="animate",
+                         args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")]),
+                ],
+            )],
+            sliders=[dict(
+                x=0.2, y=-0.12, len=0.75,
+                steps=[dict(method="animate", label=f"step {t + 1}",
+                            args=[[str(t)], dict(mode="immediate", frame=dict(duration=0, redraw=True))])
+                       for t in range(n_steps)],
+            )],
+        )
+        return fig
+
+    return (make_ptrm_explorer_figure,)
+
+
+@app.cell(hide_code=True)
+def ptrm_explorer_display(
+    DEEP_SUP,
+    PTRMSolver,
+    SUDOKU_TRAP_EXAMPLES,
+    TRMSolver,
+    Xhd,
+    Yhd,
+    decode_tokens,
+    kde_surface,
+    make_ptrm_explorer_figure,
+    np,
+    project_latent_sudoku,
+    ptrm_k_slider,
+    ptrm_puzzle_choice,
+    ptrm_sigma_slider,
+    trm,
+):
+    _idx = SUDOKU_TRAP_EXAMPLES[ptrm_puzzle_choice.value]
+    _Xone = Xhd[_idx:_idx + 1]
+    _Yone = Yhd[_idx]                                                                  # [81]
+    _true_grid = decode_tokens(_Yone).reshape(9, 9).cpu().numpy()
+
+    # --- Deterministic TRM trajectory: black ---
+    _det = TRMSolver(trm, steps=DEEP_SUP).predict(_Xone)
+    _det_lat = project_latent_sudoku(_det.reasoning_trace[0].cpu().numpy())            # [T,2]
+    _det_correct = (_det.answer_trace[0] == _Yone).sum(-1).cpu().numpy()               # [T]
+    _det_xs, _det_ys = _det_lat[:, 0], _det_lat[:, 1]
+    _det_zs = 81 - _det_correct.astype(np.float64)
+
+    # --- PTRM: K noisy rollouts of this SAME puzzle at the chosen sigma ---
+    _K = int(ptrm_k_slider.value)
+    _sigma = float(ptrm_sigma_slider.value)
+    _ptrm = PTRMSolver(trm, K=_K, steps=DEEP_SUP, sigma=_sigma).predict(_Xone, full_rollouts=True)
+    _roll_lat = _ptrm.extra["rollout_reasoning"][:, 0].cpu().numpy()                   # [K,T,h]
+    _roll_ans = _ptrm.extra["rollout_answer_trace"][:, 0]                              # [K,T,81]
+    _roll_q_step = _ptrm.extra["rollout_q_step"][:, 0].cpu().numpy()                   # [K,T]
+    _roll_correct = (_roll_ans == _Yone).sum(-1).cpu().numpy().astype(np.float64)      # [K,T]
+    _roll_success = (_roll_ans[:, -1] == _Yone).all(-1).cpu().numpy()                  # [K] bool
+    _T = _roll_lat.shape[1]
+
+    _roll_xy = project_latent_sudoku(_roll_lat.reshape(-1, trm.h)).reshape(_K, _T, 2)   # [K,T,2]
+    _roll_zs = 81 - _roll_correct                                                       # [K,T]
+
+    _pad_x = 0.1 * max(np.ptp(_roll_xy[:, :, 0]), 1e-6)
+    _pad_y = 0.1 * max(np.ptp(_roll_xy[:, :, 1]), 1e-6)
+    _xy_range = (
+        (float(_roll_xy[:, :, 0].min() - _pad_x), float(_roll_xy[:, :, 0].max() + _pad_x)),
+        (float(_roll_xy[:, :, 1].min() - _pad_y), float(_roll_xy[:, :, 1].max() + _pad_y)),
+    )
+    _z_range = (0.0, 81.0)
+    _gxx, _gyy, _zsurf, _density = kde_surface(
+        _roll_xy.reshape(-1, 2), _roll_zs.reshape(-1), _xy_range[0], _xy_range[1],
+    )
+
+    # --- Subsample rollouts for plotting so the scene stays readable at high K; the KDE surface
+    # and the per-step "best" grid above still use every rollout, only the drawn lines are capped ---
+    _MAX_LINES = 30
+    _plot_idx = np.linspace(0, _K - 1, min(_K, _MAX_LINES)).astype(int)
+    _rollouts_for_plot = [
+        (_roll_xy[_k, :, 0], _roll_xy[_k, :, 1], _roll_zs[_k], bool(_roll_success[_k]))
+        for _k in _plot_idx
+    ]
+
+    # --- Best answer by Q-head value AT EACH STEP -- can hop between different rollouts over time ---
+    _best_k_per_t = _roll_q_step.argmax(0)                                             # [T]
+    _grid_zs, _grid_texts, _frame_labels = [], [], []
+    for _t in range(_T):
+        _bk = int(_best_k_per_t[_t])
+        _g = decode_tokens(_roll_ans[_bk, _t]).cpu().numpy().reshape(9, 9)
+        _grid_zs.append((_g == _true_grid).astype(float))
+        _grid_texts.append(np.where(_g == 0, "", _g.astype(str)))
+        _nc = int(_roll_correct[_bk, _t])
+        _frame_labels.append(f"step {_t + 1}: best rollout #{_bk} — {_nc}/81 correct")
+
+    _box_lines = [
+        dict(type="line", x0=_b - 0.5, x1=_b - 0.5, y0=-0.5, y1=8.5, line=dict(color="black", width=3))
+        for _b in (3, 6)
+    ] + [
+        dict(type="line", x0=-0.5, x1=8.5, y0=_b - 0.5, y1=_b - 0.5, line=dict(color="black", width=3))
+        for _b in (3, 6)
+    ]
+
+    _n_success = int(_roll_success.sum())
+    make_ptrm_explorer_figure(
+        _grid_zs, _grid_texts, _box_lines, (_det_xs, _det_ys, _det_zs), _rollouts_for_plot,
+        f"{ptrm_puzzle_choice.value} — sigma={_sigma:.2f}, K={_K} ({_n_success}/{_K} rollouts solved)",
+        _xy_range, _z_range, _gxx, _gyy, _zsurf, _density, "# correct cells (of 81)", _frame_labels,
+    )
+    return
+
+
+@app.cell(hide_code=True)
 def _(device, mo, np, os, pd, time, torch):
     # --- sudoku-extreme: EASY training slice + matched eval + a HARDER demo slice ---
     # Shared kernel: public names are distinct (Xtr/Ytr/Xev/Yev/Xhd/Yhd) to avoid sibling-notebook clashes.
