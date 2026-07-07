@@ -427,12 +427,26 @@ def trm_vs_transformer_viz(mo):
     return
 
 
+@app.cell
+def _():
+    # # Randomly generated on TRM initialization
+    # z_L, z_H = carry_z_L or self.z_init, carry_z_H or self.y_init
+
+    # empty_puzzle, filled_puzzle = x, y
+    # input_embeddings = encode(empty_puzzle)
+
+    # carry_z_L, carry_z_H = z_L, z_H
+
+    # # Repeat this until q_logit > 0 or max steps reached
+    return
+
+
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
     You can think of each layer as a set of questions being asked. The the LLM early layers ask questions like "How many digits does each number have?", in later stages "What is a reasonable order of magnitude?". In TRMs there are less layers so fewer questions are asked. But they are asked repetitively allowing the model to refine it answer over time. For example a TRM can ask "Is digit 1 reasonable given digit 2?" and "Is digit 2 reasonable given digit 1?" over and over again. (This is reasoning!)
 
-    Below is the code for a single TRM training step.
+    Below is the code for a training a TRM on a single example.
 
     ```python
     with torch.no_grad():
@@ -449,16 +463,32 @@ def _(mo):
     lm_loss   = CategoricalCrossentropy(answer, ground_truth)
 
     q_logit   = q_head(z_H)
-    q_loss    = BinaryCrossEntropy(q_logit, isCorrect(answer))
+    q_loss    = BinaryCrossEntropy(q_logit, int(answer == filled_puzzle))
 
     loss = lm_loss + 0.5 * q_loss
+    # Repeat this until q_logit > 0 or max steps reached
     ```
-
-    <small>Adapted from [TRM Code](https://github.com/samsungsailmontreal/tinyrecursivemodels) models/recursive_reasoning/trm.py lines 208-222</small>
 
     The model updates both the reasoning and answer latents a predefined number of times with out a gradient and then calculates the loss based on the next update. L_level is the body of TRM and can be Transformer of MLP-t$^2$ blocks
 
-    The lm_head decodes the answer latent into the text/answer space. The q_head is important. For TRMs its used for Adaptive Computation Time. Problems like 20 - 10 vs 23 * 4 are different complexities and require different amounts of reasoning. To allocate a problem the required compute the q_head predicts whether the answer latent is correct. Not only does this save compute time but it can prevent a correct answer from being overwritten (prevents the model from over thinking).
+    The lm_head decodes the answer latent into the text/answer space. The q_head is important. For TRMs its used for Adaptive Computation Time. Problems like 20 - 10 vs 23 * 4 are different complexities and require different amounts of reasoning. To allocate a problem the required compute the q_head predicts whether the answer latent is correct and . Not only does this save compute time but it can prevent a correct answer from being overwritten (prevents the model from over thinking).
+
+    Code to sample
+
+    ```python
+    with torch.no_grad():
+        for _N_supervision in range(self.config.N_supervision):
+            for _H_step in range(self.config.H_cycles):
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                z_H = self.L_level(z_H, z_L, **seq_info)
+
+    answer = lm_head(z_H)
+    q_logit = q_head(z_H)
+    ```
+    Note that we repeat a set number of times (N_supervision) and do not use Adaptive Time Computation
+
+    <small>Adapted from [TRM Code](https://github.com/samsungsailmontreal/tinyrecursivemodels) models/recursive_reasoning/trm.py lines 208-222</small>
 
     2. MLP-t inspired by [MLP-Mixer: An all-MLP Architecture for Vision](https://arxiv.org/pdf/2105.01601)
     """)
@@ -720,64 +750,319 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    _ptrm_intro = mo.md(r"""## How does a PTRM escape latent traps?
+    _ptrm = mo.md(r"""## How does a PTRM escape latent traps?
 
-    PTRMs adds gaussian noise to the reasoning latent z_L at every step.
+    PTRMs adds gaussian noise to the reasoning latent z_L at every step. Below is an example sampling step
 
-    """).text
-
-    _top_fade = mo.md("""
     ```python
     with torch.no_grad():
-        for _H_step in range(self.config.H_cycles - 1):
-    ```
-    """).text
-
-    _highlight = mo.md("""
-    ```python
-            z_L = z_L + torch.randn_like(z_L) * sigma # <-- Only change!
-    ```
-    """).text
-
-    _bottom_fade = mo.md("""
-    ```python
-            for _L_step in range(self.config.L_cycles):
-                z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-            z_H = self.L_level(z_H, z_L, **seq_info)
-        
-    for _L_step in range(self.config.L_cycles):
-        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-    z_H = self.L_level(z_H, z_L, **seq_info)
+        for _N_supervision in range(self.config.N_supervision):
+            for _H_step in range(self.config.H_cycles):
+                z_L += torch.randn_like(z_L) * sigma # <-- Only change!
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                z_H = self.L_level(z_H, z_L, **seq_info)
 
     answer = lm_head(z_H)
-    lm_loss   = CategoricalCrossentropy(answer, ground_truth)
-
     q_logit   = q_head(z_H)
-    q_loss    = BinaryCrossEntropy(q_logit, isCorrect(answer))
+    ```""")
 
-    loss = lm_loss + 0.5 * q_loss
-    ```
-    """).text
-
-    _style = '<style>.ptrms-block pre { margin: 0 !important; } .ptrms-block p { margin: 0 !important; }</style>'
-
-    _ptrms_solve_this = mo.Html(
-        _style + '<div class="ptrms-block">'
-        + _ptrm_intro
-        + '<div style="opacity: 0.7;">' + _top_fade + '</div>'
-        + _highlight
-        + '<div style="opacity: 0.7;">' + _bottom_fade + '</div>'
-        + '</div>'
-    )
-    _ptrms_solve_this
+    _ptrm
     return
 
 
 @app.cell
 def _(mo):
-    _what_ptrm_param = mo.md(r"""Since the PTRM is non-deterministic. Meaning the same output will give different results. We can run the PTRM any number of times and choose the best results, this is the number of roll outs previously mentioned.""")
+    _what_ptrm_param = mo.md(r"""Since the PTRM is non-deterministic. Meaning the same output will give different results. We can run the PTRM any number of times and choose the best results, this is the number of roll outs previously mentioned.
+
+    But how do we find the "best" roll out? The Q Head already scores the TRM by approximating how correct it latent answer is. So we can apply the Q Head to each roll out and choose the best answer at that given time point.
+
+    Note that since we did not change the weights we do not have to retrain the TRM!
+    """)
 
     _what_ptrm_param
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Try it yourself: PTRM rollout explorer
+
+    Pick one of the same stuck puzzles from above, then adjust sigma (noise added to z_L at every
+    step) and K (number of parallel rollouts). The TRM's deterministic path is drawn in **black**;
+    each PTRM rollout is **green** if it lands on the exact solution and **red** if it doesn't. The
+    grid on the left tracks the single best rollout *at each time step*, chosen by Q-head value —
+    watch which rollout the Q head trusts most as reasoning unfolds.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(SUDOKU_TRAP_EXAMPLES, mo):
+    ptrm_puzzle_choice = mo.ui.dropdown(
+        options=list(SUDOKU_TRAP_EXAMPLES.keys()),
+        value=next(iter(SUDOKU_TRAP_EXAMPLES)),
+        label="Choose a stuck puzzle",
+    )
+    ptrm_sigma_slider = mo.ui.slider(0.0, 0.5, value=0.15, step=0.01, label="sigma (noise)")
+    ptrm_k_slider = mo.ui.slider(8, 128, value=64, step=8, label="K (rollouts)")
+    mo.hstack([ptrm_puzzle_choice, ptrm_sigma_slider, ptrm_k_slider])
+    return ptrm_k_slider, ptrm_puzzle_choice, ptrm_sigma_slider
+
+
+@app.cell(hide_code=True)
+def _(go, make_subplots):
+    # --- Grid | 3D scene (rowspan 2) | Q-value distribution, with a correct-cells distribution
+    # underneath the grid -- all four panels animate together off ONE shared Play/Pause + slider. ---
+    def make_ptrm_explorer_figure(grid_zs, grid_texts, box_lines, det_xyz, rollouts,
+                                   roll_q_success, roll_q_fail, roll_correct_all, q_range, title,
+                                   xy_range, z_range, surface_x, surface_y, surface_z,
+                                   surface_density, z_label, frame_labels):
+        xs_d, ys_d, zs_d = det_xyz
+        n_steps = len(xs_d)
+        n_roll = len(rollouts)
+        corr_range = (float(z_range[0]), float(z_range[1]))
+        q_bins = 24
+        q_bin_size = max((q_range[1] - q_range[0]) / q_bins, 1e-6)
+
+        fig = make_subplots(
+            rows=2, cols=3,
+            specs=[[{"type": "xy"}, {"type": "scene", "rowspan": 2}, {"type": "xy"}],
+                   [{"type": "xy"}, None, {"type": "xy"}]],
+            column_widths=[0.24, 0.52, 0.24], row_heights=[0.5, 0.5],
+            subplot_titles=("reasoning trace", "", "Q-value distribution",
+                             "correct-cells distribution", "Q value over time"),
+        )
+
+        fig.add_trace(go.Heatmap(
+            z=grid_zs[0], text=grid_texts[0], texttemplate="%{text}", textfont=dict(size=14),
+            colorscale=[[0, "#e03131"], [1, "#2f9e44"]], zmin=0, zmax=1,
+            showscale=False, xgap=2, ygap=2,
+        ), row=1, col=1)
+        fig.add_trace(go.Surface(
+            x=surface_x, y=surface_y, z=surface_z, surfacecolor=surface_density,
+            colorscale="Blues", opacity=0.55, showscale=False,
+            contours=dict(z=dict(show=True, usecolormap=True, project=dict(z=True))),
+        ), row=1, col=2)
+        for (xs_k, ys_k, zs_k, ok) in rollouts:
+            fig.add_trace(go.Scatter3d(
+                x=[xs_k[0]], y=[ys_k[0]], z=[zs_k[0]], mode="lines",
+                line=dict(color="#2f9e44" if ok else "#e03131", width=3), opacity=0.55,
+                showlegend=False, hoverinfo="skip",
+            ), row=1, col=2)
+        fig.add_trace(go.Scatter3d(x=[xs_d[0]], y=[ys_d[0]], z=[zs_d[0]], mode="lines",
+                                    line=dict(color="black", width=7), showlegend=False,
+                                    hoverinfo="skip"), row=1, col=2)
+        fig.add_trace(go.Scatter3d(x=[xs_d[0]], y=[ys_d[0]], z=[zs_d[0]], mode="markers",
+                                    marker=dict(size=7, color="black"), showlegend=False,
+                                    hoverinfo="skip"), row=1, col=2)
+        _q_success_idx = 4 + n_roll
+        _q_fail_idx = 5 + n_roll
+        _corr_hist_idx = 6 + n_roll
+        fig.add_trace(go.Histogram(
+            x=roll_q_success[:, 0], xbins=dict(start=q_range[0], end=q_range[1], size=q_bin_size),
+            autobinx=False, marker=dict(color="#2f9e44"), name="solved", showlegend=False,
+        ), row=1, col=3)
+        fig.add_trace(go.Histogram(
+            x=roll_q_fail[:, 0], xbins=dict(start=q_range[0], end=q_range[1], size=q_bin_size),
+            autobinx=False, marker=dict(color="#e03131"), name="unsolved", showlegend=False,
+        ), row=1, col=3)
+        fig.add_trace(go.Histogram(
+            x=roll_correct_all[:, 0], xbins=dict(start=corr_range[0] - 0.5, end=corr_range[1] + 0.5, size=1),
+            autobinx=False, marker=dict(color="#f08c00"), showlegend=False,
+        ), row=2, col=1)
+
+        # --- Static (non-animated) summary: Q value over time, solved vs unsolved rollouts.
+        # Drawn once, outside the frame loop, so it doesn't move as you scrub through steps. ---
+        _steps_x = list(range(1, n_steps + 1))
+        for _roll_q, _color, _fill, _name in (
+            (roll_q_success, "#2f9e44", "rgba(47,158,68,0.15)", "solved"),
+            (roll_q_fail, "#e03131", "rgba(224,49,49,0.15)", "unsolved"),
+        ):
+            if _roll_q.shape[0] == 0:
+                continue
+            _qmin, _qmax, _qmean = _roll_q.min(0), _roll_q.max(0), _roll_q.mean(0)
+            fig.add_trace(go.Scatter(
+                x=_steps_x + _steps_x[::-1], y=list(_qmax) + list(_qmin[::-1]),
+                mode="lines", fill="toself", fillcolor=_fill, line=dict(width=0),
+                showlegend=False, hoverinfo="skip",
+            ), row=2, col=3)
+            fig.add_trace(go.Scatter(
+                x=_steps_x, y=list(_qmean), mode="lines+markers",
+                line=dict(color=_color, width=3), marker=dict(size=5, color=_color), name=_name,
+            ), row=2, col=3)
+
+        frames = []
+        for t in range(n_steps):
+            frame_data = [go.Heatmap(z=grid_zs[t], text=grid_texts[t])]
+            traces = [0]
+            for ri, (xs_k, ys_k, zs_k, _ok) in enumerate(rollouts):
+                frame_data.append(go.Scatter3d(x=xs_k[:t + 1], y=ys_k[:t + 1], z=zs_k[:t + 1]))
+                traces.append(2 + ri)
+            frame_data.append(go.Scatter3d(x=xs_d[:t + 1], y=ys_d[:t + 1], z=zs_d[:t + 1]))
+            traces.append(2 + n_roll)
+            frame_data.append(go.Scatter3d(x=[xs_d[t]], y=[ys_d[t]], z=[zs_d[t]]))
+            traces.append(3 + n_roll)
+            frame_data.append(go.Histogram(x=roll_q_success[:, t]))
+            traces.append(_q_success_idx)
+            frame_data.append(go.Histogram(x=roll_q_fail[:, t]))
+            traces.append(_q_fail_idx)
+            frame_data.append(go.Histogram(x=roll_correct_all[:, t]))
+            traces.append(_corr_hist_idx)
+            frames.append(go.Frame(
+                data=frame_data, traces=traces, name=str(t),
+                layout=go.Layout(annotations=[dict(text=frame_labels[t], showarrow=False, x=0.5,
+                                                    y=1.08, xref="paper", yref="paper",
+                                                    font=dict(size=14))]),
+            ))
+        fig.frames = frames
+
+        fig.update_xaxes(visible=False, row=1, col=1)
+        fig.update_yaxes(visible=False, autorange="reversed", row=1, col=1)
+        fig.update_xaxes(title_text="Q logit", range=list(q_range), row=1, col=3)
+        fig.update_yaxes(title_text="# rollouts", row=1, col=3)
+        fig.update_xaxes(title_text="# correct cells (of 81)", range=[corr_range[0] - 0.5, corr_range[1] + 0.5],
+                          row=2, col=1)
+        fig.update_yaxes(title_text="# rollouts", row=2, col=1)
+        fig.update_xaxes(title_text="step", showgrid=False, showline=True, linecolor="black",
+                          mirror=True, row=2, col=3)
+        fig.update_yaxes(title_text="Q logit", showgrid=False, showline=True, linecolor="black",
+                          mirror=True, row=2, col=3)
+        fig.update_layout(
+            title=title, height=640,
+            barmode="stack",
+            shapes=box_lines,
+            scene=dict(
+                xaxis=dict(title="PC1", range=list(xy_range[0])),
+                yaxis=dict(title="PC2", range=list(xy_range[1])),
+                zaxis=dict(title=z_label, range=list(z_range)),
+            ),
+            margin=dict(l=0, r=0, t=60, b=80),
+            annotations=[dict(text=frame_labels[0], showarrow=False, x=0.5, y=1.08,
+                              xref="paper", yref="paper", font=dict(size=16))],
+            updatemenus=[dict(
+                type="buttons", showactive=False, x=0.05, y=-0.1, xanchor="left", yanchor="top",
+                buttons=[
+                    dict(label="▶ Play", method="animate",
+                         args=[None, dict(frame=dict(duration=700, redraw=True),
+                                          transition=dict(duration=300, easing="cubic-in-out"),
+                                          fromcurrent=True)]),
+                    dict(label="⏸ Pause", method="animate",
+                         args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")]),
+                ],
+            )],
+            sliders=[dict(
+                x=0.2, y=-0.1, len=0.75,
+                steps=[dict(method="animate", label=f"step {t + 1}",
+                            args=[[str(t)], dict(mode="immediate", frame=dict(duration=0, redraw=True))])
+                       for t in range(n_steps)],
+            )],
+        )
+        return fig
+
+    return (make_ptrm_explorer_figure,)
+
+
+@app.cell(hide_code=True)
+def ptrm_explorer_display(
+    DEEP_SUP,
+    PTRMSolver,
+    SUDOKU_TRAP_EXAMPLES,
+    TRMSolver,
+    Xhd,
+    Yhd,
+    decode_tokens,
+    kde_surface,
+    make_ptrm_explorer_figure,
+    np,
+    project_latent_sudoku,
+    ptrm_k_slider,
+    ptrm_puzzle_choice,
+    ptrm_sigma_slider,
+    trm,
+):
+    _idx = SUDOKU_TRAP_EXAMPLES[ptrm_puzzle_choice.value]
+    _Xone = Xhd[_idx:_idx + 1]
+    _Yone = Yhd[_idx]                                                                  # [81]
+    _true_grid = decode_tokens(_Yone).reshape(9, 9).cpu().numpy()
+
+    # --- Deterministic TRM trajectory: black ---
+    _det = TRMSolver(trm, steps=DEEP_SUP).predict(_Xone)
+    _det_lat = project_latent_sudoku(_det.reasoning_trace[0].cpu().numpy())            # [T,2]
+    _det_correct = (_det.answer_trace[0] == _Yone).sum(-1).cpu().numpy()               # [T]
+    _det_xs, _det_ys = _det_lat[:, 0], _det_lat[:, 1]
+    _det_zs = 81 - _det_correct.astype(np.float64)
+
+    # --- PTRM: K noisy rollouts of this SAME puzzle at the chosen sigma ---
+    _K = int(ptrm_k_slider.value)
+    _sigma = float(ptrm_sigma_slider.value)
+    _ptrm = PTRMSolver(trm, K=_K, steps=DEEP_SUP, sigma=_sigma).predict(_Xone, full_rollouts=True)
+    _roll_lat = _ptrm.extra["rollout_reasoning"][:, 0].cpu().numpy()                   # [K,T,h]
+    _roll_ans = _ptrm.extra["rollout_answer_trace"][:, 0]                              # [K,T,81]
+    _roll_q_step = _ptrm.extra["rollout_q_step"][:, 0].cpu().numpy()                   # [K,T]
+    _roll_correct = (_roll_ans == _Yone).sum(-1).cpu().numpy().astype(np.float64)      # [K,T]
+    _roll_success = (_roll_ans[:, -1] == _Yone).all(-1).cpu().numpy()                  # [K] bool
+    _T = _roll_lat.shape[1]
+
+    _roll_xy = project_latent_sudoku(_roll_lat.reshape(-1, trm.h)).reshape(_K, _T, 2)   # [K,T,2]
+    _roll_zs = 81 - _roll_correct                                                       # [K,T]
+
+    _pad_x = 0.1 * max(np.ptp(_roll_xy[:, :, 0]), 1e-6)
+    _pad_y = 0.1 * max(np.ptp(_roll_xy[:, :, 1]), 1e-6)
+    _xy_range = (
+        (float(_roll_xy[:, :, 0].min() - _pad_x), float(_roll_xy[:, :, 0].max() + _pad_x)),
+        (float(_roll_xy[:, :, 1].min() - _pad_y), float(_roll_xy[:, :, 1].max() + _pad_y)),
+    )
+    _z_range = (0.0, 81.0)
+    _gxx, _gyy, _zsurf, _density = kde_surface(
+        _roll_xy.reshape(-1, 2), _roll_zs.reshape(-1), _xy_range[0], _xy_range[1],
+    )
+
+    # --- Q-value range for the distribution histogram, fixed across frames so bins don't jump ---
+    _q_pad = 0.05 * max(np.ptp(_roll_q_step), 1e-6)
+    _q_range = (float(_roll_q_step.min() - _q_pad), float(_roll_q_step.max() + _q_pad))
+
+    # --- Split Q-values by each rollout's FINAL outcome, so the histogram bars stack green
+    # (pathways that end up correct) on top of red (pathways that end up wrong) ---
+    _roll_q_success = _roll_q_step[_roll_success]      # [Ksucc, T]
+    _roll_q_fail = _roll_q_step[~_roll_success]        # [Kfail, T]
+
+    # --- Subsample rollouts for plotting so the scene stays readable at high K; the KDE surface
+    # and the per-step "best" grid above still use every rollout, only the drawn lines are capped ---
+    _MAX_LINES = 30
+    _plot_idx = np.linspace(0, _K - 1, min(_K, _MAX_LINES)).astype(int)
+    _rollouts_for_plot = [
+        (_roll_xy[_k, :, 0], _roll_xy[_k, :, 1], _roll_zs[_k], bool(_roll_success[_k]))
+        for _k in _plot_idx
+    ]
+
+    # --- Best answer by Q-head value AT EACH STEP -- can hop between different rollouts over time ---
+    _best_k_per_t = _roll_q_step.argmax(0)                                             # [T]
+    _grid_zs, _grid_texts, _frame_labels = [], [], []
+    for _t in range(_T):
+        _bk = int(_best_k_per_t[_t])
+        _g = decode_tokens(_roll_ans[_bk, _t]).cpu().numpy().reshape(9, 9)
+        _grid_zs.append((_g == _true_grid).astype(float))
+        _grid_texts.append(np.where(_g == 0, "", _g.astype(str)))
+        _nc = int(_roll_correct[_bk, _t])
+        _frame_labels.append(f"step {_t + 1}: best rollout #{_bk} — {_nc}/81 correct")
+
+    _box_lines = [
+        dict(type="line", x0=_b - 0.5, x1=_b - 0.5, y0=-0.5, y1=8.5, line=dict(color="black", width=3))
+        for _b in (3, 6)
+    ] + [
+        dict(type="line", x0=-0.5, x1=8.5, y0=_b - 0.5, y1=_b - 0.5, line=dict(color="black", width=3))
+        for _b in (3, 6)
+    ]
+
+    _n_success = int(_roll_success.sum())
+    make_ptrm_explorer_figure(
+        _grid_zs, _grid_texts, _box_lines, (_det_xs, _det_ys, _det_zs), _rollouts_for_plot,
+        _roll_q_success, _roll_q_fail, _roll_correct, _q_range,
+        f"{ptrm_puzzle_choice.value} — sigma={_sigma:.2f}, K={_K} ({_n_success}/{_K} rollouts solved)",
+        _xy_range, _z_range, _gxx, _gyy, _zsurf, _density, "# correct cells (of 81)", _frame_labels,
+    )
     return
 
 
