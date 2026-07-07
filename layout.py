@@ -427,12 +427,26 @@ def trm_vs_transformer_viz(mo):
     return
 
 
+@app.cell
+def _():
+    # # Randomly generated on TRM initialization
+    # z_L, z_H = carry_z_L or self.z_init, carry_z_H or self.y_init
+
+    # empty_puzzle, filled_puzzle = x, y
+    # input_embeddings = encode(empty_puzzle)
+
+    # carry_z_L, carry_z_H = z_L, z_H
+
+    # # Repeat this until q_logit > 0 or max steps reached
+    return
+
+
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
     You can think of each layer as a set of questions being asked. The the LLM early layers ask questions like "How many digits does each number have?", in later stages "What is a reasonable order of magnitude?". In TRMs there are less layers so fewer questions are asked. But they are asked repetitively allowing the model to refine it answer over time. For example a TRM can ask "Is digit 1 reasonable given digit 2?" and "Is digit 2 reasonable given digit 1?" over and over again. (This is reasoning!)
 
-    Below is the code for a single TRM training step.
+    Below is the code for a training a TRM on a single example.
 
     ```python
     with torch.no_grad():
@@ -449,16 +463,32 @@ def _(mo):
     lm_loss   = CategoricalCrossentropy(answer, ground_truth)
 
     q_logit   = q_head(z_H)
-    q_loss    = BinaryCrossEntropy(q_logit, isCorrect(answer))
+    q_loss    = BinaryCrossEntropy(q_logit, int(answer == filled_puzzle))
 
     loss = lm_loss + 0.5 * q_loss
+    # Repeat this until q_logit > 0 or max steps reached
     ```
-
-    <small>Adapted from [TRM Code](https://github.com/samsungsailmontreal/tinyrecursivemodels) models/recursive_reasoning/trm.py lines 208-222</small>
 
     The model updates both the reasoning and answer latents a predefined number of times with out a gradient and then calculates the loss based on the next update. L_level is the body of TRM and can be Transformer of MLP-t$^2$ blocks
 
-    The lm_head decodes the answer latent into the text/answer space. The q_head is important. For TRMs its used for Adaptive Computation Time. Problems like 20 - 10 vs 23 * 4 are different complexities and require different amounts of reasoning. To allocate a problem the required compute the q_head predicts whether the answer latent is correct. Not only does this save compute time but it can prevent a correct answer from being overwritten (prevents the model from over thinking).
+    The lm_head decodes the answer latent into the text/answer space. The q_head is important. For TRMs its used for Adaptive Computation Time. Problems like 20 - 10 vs 23 * 4 are different complexities and require different amounts of reasoning. To allocate a problem the required compute the q_head predicts whether the answer latent is correct and . Not only does this save compute time but it can prevent a correct answer from being overwritten (prevents the model from over thinking).
+
+    Code to sample
+
+    ```python
+    with torch.no_grad():
+        for _N_supervision in range(self.config.N_supervision):
+            for _H_step in range(self.config.H_cycles):
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                z_H = self.L_level(z_H, z_L, **seq_info)
+
+    answer = lm_head(z_H)
+    q_logit = q_head(z_H)
+    ```
+    Note that we repeat a set number of times (N_supervision) and do not use Adaptive Time Computation
+
+    <small>Adapted from [TRM Code](https://github.com/samsungsailmontreal/tinyrecursivemodels) models/recursive_reasoning/trm.py lines 208-222</small>
 
     2. MLP-t inspired by [MLP-Mixer: An all-MLP Architecture for Vision](https://arxiv.org/pdf/2105.01601)
     """)
@@ -720,62 +750,35 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    _ptrm_intro = mo.md(r"""## How does a PTRM escape latent traps?
+    _ptrm = mo.md(r"""## How does a PTRM escape latent traps?
 
-    PTRMs adds gaussian noise to the reasoning latent z_L at every step.
+    PTRMs adds gaussian noise to the reasoning latent z_L at every step. Below is an example sampling step
 
-    """).text
-
-    _top_fade = mo.md("""
     ```python
     with torch.no_grad():
-        for _H_step in range(self.config.H_cycles - 1):
-    ```
-    """).text
-
-    _highlight = mo.md("""
-    ```python
-            z_L = z_L + torch.randn_like(z_L) * sigma # <-- Only change!
-    ```
-    """).text
-
-    _bottom_fade = mo.md("""
-    ```python
-            for _L_step in range(self.config.L_cycles):
-                z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-            z_H = self.L_level(z_H, z_L, **seq_info)
-        
-    for _L_step in range(self.config.L_cycles):
-        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-    z_H = self.L_level(z_H, z_L, **seq_info)
+        for _N_supervision in range(self.config.N_supervision):
+            for _H_step in range(self.config.H_cycles):
+                z_L += torch.randn_like(z_L) * sigma # <-- Only change!
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                z_H = self.L_level(z_H, z_L, **seq_info)
 
     answer = lm_head(z_H)
-    lm_loss   = CategoricalCrossentropy(answer, ground_truth)
-
     q_logit   = q_head(z_H)
-    q_loss    = BinaryCrossEntropy(q_logit, isCorrect(answer))
+    ```""")
 
-    loss = lm_loss + 0.5 * q_loss
-    ```
-    """).text
-
-    _style = '<style>.ptrms-block pre { margin: 0 !important; } .ptrms-block p { margin: 0 !important; }</style>'
-
-    _ptrms_solve_this = mo.Html(
-        _style + '<div class="ptrms-block">'
-        + _ptrm_intro
-        + '<div style="opacity: 0.7;">' + _top_fade + '</div>'
-        + _highlight
-        + '<div style="opacity: 0.7;">' + _bottom_fade + '</div>'
-        + '</div>'
-    )
-    _ptrms_solve_this
+    _ptrm
     return
 
 
 @app.cell
 def _(mo):
-    _what_ptrm_param = mo.md(r"""Since the PTRM is non-deterministic. Meaning the same output will give different results. We can run the PTRM any number of times and choose the best results, this is the number of roll outs previously mentioned.""")
+    _what_ptrm_param = mo.md(r"""Since the PTRM is non-deterministic. Meaning the same output will give different results. We can run the PTRM any number of times and choose the best results, this is the number of roll outs previously mentioned.
+
+    But how do we find the "best" roll out? The Q Head already scores the TRM by approximating how correct it latent answer is. So we can apply the Q Head to each roll out and choose the best answer at that given time point.
+
+    Note that since we did not change the weights we do not have to retrain the TRM!
+    """)
 
     _what_ptrm_param
     return
