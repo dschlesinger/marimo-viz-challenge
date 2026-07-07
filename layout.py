@@ -1067,6 +1067,297 @@ def ptrm_explorer_display(
 
 
 @app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Why not just add noise?
+
+    PTRM's trick is embarrassingly simple: inject fresh Gaussian noise into `z_L`
+    at *every* step and run `K` independent rollouts, then keep whichever rollout
+    the Q-head likes best at the end. It works — but it's **K× the compute** of a
+    single deterministic TRM pass, since every rollout pays for the full
+    `H_cycles * L_cycles` recursion at each step.
+
+    If K noisy rollouts help by giving the model K independent chances to escape
+    a bad latent basin, could something *smarter* than resampling i.i.d. noise get
+    similar escape behavior for less (or no) extra compute? A few candidates,
+    all scaled so one step's perturbation has the same variance as PTRM's plain
+    i.i.d. noise — only the noise's **temporal structure** differs, not its size:
+
+    - **i.i.d. (baseline)** — PTRM as-is: fresh `ε_t ~ N(0,σ²)` added to `z_L` every step.
+    - **Momentum, 1st order** — smooth the noise into a random walk instead of
+      resampling it: `v_t = β·v_{t-1} + √(1-β²)·ξ_t`, inject `σ·v_t`. The
+      perturbation drifts in a direction instead of jittering step to step.
+    - **Momentum, 2nd order** — give the drift its own inertia: an accelerating
+      random walk (`a_t = β₂·a_{t-1} + ξ_t`, then `v_t = β₁·v_{t-1} + a_t`),
+      injected the same way. Slower to change direction than 1st-order momentum.
+    - **Momentum + noise** — a momentum-smoothed drift *plus* a smaller i.i.d.
+      component layered on top, so the trajectory can still jitter locally while
+      drifting globally.
+    - **Noise at init only** — perturb only the very first `z_H` and `z_L` (the
+      initial carry, before step 1 of the recursion), then run the rest of the
+      supervision steps with **zero** injected noise: K deterministic
+      trajectories from K different starting points, rather than K trajectories
+      that keep getting perturbed along the way.
+
+    All four of the above are still fundamentally *random* — momentum there just
+    changes the noise's temporal correlation, not whether there's noise at all.
+    One more candidate removes randomness entirely:
+
+    - **Inertia (no noise at all)** — apply heavy-ball momentum to the model's
+      *own* recurrence, not to injected noise. Each step already produces some
+      update `z_L → z_L'`; track that update as a velocity, `v_t = β·v_{t-1} +
+      (z_L' - z_L)`, and push the state further along it before the next step:
+      `z_L ← z_L' + β·v_t`. If the model keeps nudging in a consistent direction
+      (e.g. slowly trying to escape a bad basin but not quite making it), inertia
+      amplifies that instead of resetting every step — for a **single**,
+      completely deterministic rollout. `β=0` recovers plain TRM exactly.
+
+    The question this section tries to answer: at matched rollout count `K`, do
+    any of these beat plain i.i.d. noise? And more importantly — does any of them
+    (inertia especially, since it costs nothing extra) let a **single** rollout
+    do meaningfully better than deterministic TRM alone?
+
+    The sweep below runs real forward passes across 6 modes × 6 values of `K` —
+    it uses a **fixed, preset configuration** (not sliders) and caches its
+    results to disk on first run, since re-running it on every edit would be
+    needlessly expensive.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(amp, math, torch):
+    def noisy_rollout_predict(model, X, Y, K, steps, sigma, mode, beta1=0.9, beta2=0.9, max_par=256):
+        """K parallel rollouts of `model` on puzzles X. For noise modes ('iid', 'momentum1',
+        'momentum2', 'momentum_plus_noise', 'init_only'), a sigma-scaled perturbation is injected
+        into z_L (and z_H too, for 'init_only'); every noise mode is normalized to unit stationary
+        variance per step, so sigma means the same thing across them -- only the noise's temporal
+        structure changes, not its magnitude. 'inertia' is different: no randomness anywhere --
+        it applies heavy-ball momentum (coefficient beta1) to the recurrence's own update, so all K
+        rollouts of an 'inertia' run are identical (sigma is ignored). Returns (selected_solved,
+        oracle_solved), both [B] bool: whether the Q-head's chosen rollout got an exact match, and
+        whether ANY of the K rollouts did (the ceiling PTRM's selection rule could possibly reach).
+        max_par caps how many (rollout, puzzle) pairs run through the model at once -- kept small
+        (256) on purpose since this model's SwiGLU layers are ~1500 wide, so a big batch here is
+        the single easiest way to blow past a small GPU's VRAM. Larger N/K sweep over more chunks
+        instead of one huge batch; each chunk's CUDA memory is released before the next starts."""
+        m = model; m.eval()
+        B = X.shape[0]
+        chunk = max(1, max_par // K)
+        if B > chunk:
+            sel, oracle = [], []
+            for i in range(0, B, chunk):
+                s, o = noisy_rollout_predict(model, X[i:i + chunk], Y[i:i + chunk], K, steps, sigma,
+                                              mode, beta1, beta2, max_par)
+                sel.append(s); oracle.append(o)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()        # release this chunk's activations before the next
+            return torch.cat(sel), torch.cat(oracle)
+
+        Xr = X.repeat(K, 1)
+        zH, zL = m.init_carry(K * B)
+        if mode == "init_only" and sigma > 0:
+            zH = zH + sigma * torch.randn_like(zH)
+            zL = zL + sigma * torch.randn_like(zL)
+
+        v = torch.zeros_like(zL)      # momentum/velocity -- momentum1/momentum2/combo/inertia
+        a = torch.zeros_like(zL)      # acceleration state -- momentum2 only
+        with torch.no_grad():
+            for _ in range(steps):
+                if mode == "inertia":
+                    zL_before = zL
+                    with amp():
+                        zH, zL, logits, qh, qc = m.recur(zH, zL, Xr)
+                    v = beta1 * v + (zL - zL_before)   # velocity = smoothed update direction, zero noise
+                    zL = zL + beta1 * v                 # overshoot along it before the next step
+                    continue
+                if sigma > 0 and mode != "init_only":
+                    xi = torch.randn_like(zL)
+                    if mode == "iid":
+                        eps = xi
+                    elif mode == "momentum1":
+                        v = beta1 * v + math.sqrt(max(1 - beta1 ** 2, 0.0)) * xi
+                        eps = v
+                    elif mode == "momentum2":
+                        a = beta2 * a + math.sqrt(max(1 - beta2 ** 2, 0.0)) * xi
+                        v = beta1 * v + math.sqrt(max(1 - beta1 ** 2, 0.0)) * a
+                        eps = v
+                    elif mode == "momentum_plus_noise":
+                        v = beta1 * v + math.sqrt(max(1 - beta1 ** 2, 0.0)) * torch.randn_like(zL)
+                        eps = math.sqrt(0.5) * v + math.sqrt(0.5) * xi
+                    else:
+                        raise ValueError(f"unknown mode {mode!r}")
+                    zL = zL + sigma * eps
+                with amp():
+                    zH, zL, logits, qh, qc = m.recur(zH, zL, Xr)
+
+        ans = logits.argmax(-1).view(K, B, -1)                    # [K,B,81] final-step answer per rollout
+        q = qh.view(K, B)                                          # [K,B]    final-step Q per rollout
+        correct = (ans == Y.unsqueeze(0)).all(-1)                  # [K,B] bool, exact match vs Y
+        best_k = q.argmax(0)                                       # [B] PTRM's own selection rule
+        selected_solved = correct[best_k, torch.arange(B, device=X.device)]
+        oracle_solved = correct.any(0)
+        del zH, zL, Xr, logits, qh, qc, v, a           # drop the big activations explicitly
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return selected_solved, oracle_solved
+
+    return (noisy_rollout_predict,)
+
+
+@app.cell(hide_code=True)
+def _(DEEP_SUP, Xhd, Yhd, go, mo, noisy_rollout_predict, os, pd, trm):
+    # --- Fixed, preset sweep config -- deliberately NOT exposed as sliders (this runs real
+    # forward passes, and re-running it on every edit would be expensive). Results are cached to
+    # disk on first run, so opening the notebook again costs zero extra GPU memory/time. Edit the
+    # constants below directly (and delete the cache file) to change the sweep.
+    #
+    # VRAM note: noisy_rollout_predict caps every forward pass at max_par=256 (K,B) puzzle x
+    # rollout pairs and frees CUDA memory after each chunk/call, so this sweep stays well under
+    # 1GB of transient GPU memory even on a 4GB card -- regardless of N or K below. ---
+    _N = 128                    # eval puzzles, from the harder demo slice (Xhd/Yhd)
+    _SIGMA = 0.15                # noise scale, matched across all noise modes
+    _BETA1 = 0.9                 # momentum / inertia coefficient
+    _BETA2 = 0.9                 # 2nd-order momentum coefficient
+    _K_LIST = [1, 2, 4, 8, 16, 32]
+    _MODES = [
+        ("iid", "i.i.d. noise (plain PTRM)"),
+        ("momentum1", "momentum (1st order)"),
+        ("momentum2", "momentum (2nd order)"),
+        ("momentum_plus_noise", "momentum + noise"),
+        ("init_only", "noise at init only"),
+        ("inertia", "inertia (no noise)"),
+    ]
+    _cache = "noise_ablation_cache.csv"
+
+    if os.path.exists(_cache):
+        noise_ablation_results = pd.read_csv(_cache)
+    else:
+        import gc
+        import torch as _torch
+
+        _X, _Y = Xhd[:_N], Yhd[:_N]
+        _rows = []
+        for _mode, _label in _MODES:
+            if _mode == "inertia":
+                # deterministic -- one rollout tells you the result for every K
+                _sel, _oracle = noisy_rollout_predict(
+                    trm, _X, _Y, K=1, steps=DEEP_SUP, sigma=0.0, mode=_mode, beta1=_BETA1, beta2=_BETA2,
+                )
+                _r_sel, _r_oracle = float(_sel.float().mean()), float(_oracle.float().mean())
+                for _K in _K_LIST:
+                    _rows.append(dict(mode=_label, K=_K, selected_rate=_r_sel, oracle_rate=_r_oracle))
+                continue
+            for _K in _K_LIST:
+                _sel, _oracle = noisy_rollout_predict(
+                    trm, _X, _Y, K=_K, steps=DEEP_SUP, sigma=_SIGMA, mode=_mode, beta1=_BETA1, beta2=_BETA2,
+                )
+                _rows.append(dict(mode=_label, K=_K,
+                                   selected_rate=float(_sel.float().mean()),
+                                   oracle_rate=float(_oracle.float().mean())))
+        _det_sel, _det_oracle = noisy_rollout_predict(trm, _X, _Y, K=1, steps=DEEP_SUP, sigma=0.0, mode="iid")
+        _rows.append(dict(mode="__deterministic__", K=0,
+                           selected_rate=float(_det_sel.float().mean()),
+                           oracle_rate=float(_det_oracle.float().mean())))
+        noise_ablation_results = pd.DataFrame(_rows)
+        noise_ablation_results.to_csv(_cache, index=False)
+
+        gc.collect()                                     # sweep's done -- hand the GPU memory back
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+
+    noise_ablation_det_rate = float(
+        noise_ablation_results.loc[
+            noise_ablation_results["mode"] == "__deterministic__", "selected_rate"
+        ].iloc[0]
+    )
+    _plot_df = noise_ablation_results[noise_ablation_results["mode"] != "__deterministic__"]
+
+    _colors = {
+        "i.i.d. noise (plain PTRM)": "#1971c2",
+        "momentum (1st order)": "#f08c00",
+        "momentum (2nd order)": "#e8590c",
+        "momentum + noise": "#9c36b5",
+        "noise at init only": "#2f9e44",
+        "inertia (no noise)": "#495057",
+    }
+    _fig = go.Figure()
+    for _mode, _label in _MODES:
+        _d = _plot_df[_plot_df["mode"] == _label]
+        _fig.add_trace(go.Scatter(
+            x=_d["K"], y=_d["selected_rate"], mode="lines+markers", name=_label,
+            line=dict(color=_colors[_label], width=3), marker=dict(size=7),
+        ))
+        _fig.add_trace(go.Scatter(
+            x=_d["K"], y=_d["oracle_rate"], mode="lines", name=f"{_label} (oracle)",
+            line=dict(color=_colors[_label], dash="dot", width=1.5), opacity=0.55, showlegend=False,
+        ))
+    _fig.add_hline(
+        y=noise_ablation_det_rate, line=dict(color="black", dash="dash"),
+        annotation_text=f"deterministic TRM ({noise_ablation_det_rate:.0%})", annotation_position="bottom right",
+    )
+    _fig.update_xaxes(
+        type="log", title_text="K (rollouts / compute multiplier)", tickvals=_K_LIST,
+        showgrid=False, showline=True, linecolor="black", mirror=True,
+    )
+    _fig.update_yaxes(
+        title_text="solve rate (exact match)", tickformat=".0%", range=[0, 1],
+        showgrid=False, showline=True, linecolor="black", mirror=True,
+    )
+    _fig.update_layout(
+        title=f"Noise strategy vs. compute — N={_N} puzzles, sigma={_SIGMA:.2f} "
+              "(solid = Q-head selected, dotted = oracle best-of-K)",
+        height=480, margin=dict(l=0, r=0, t=60, b=0),
+        legend=dict(orientation="h", y=-0.25),
+    )
+    mo.vstack([_fig, mo.ui.table(_plot_df, label="raw sweep results")])
+    return noise_ablation_det_rate, noise_ablation_results
+
+
+@app.cell(hide_code=True)
+def _(noise_ablation_det_rate, noise_ablation_results, pd):
+    # --- Summary: every method side-by-side, from deterministic TRM through plain PTRM to the
+    # momentum/init-only variants -- solve rate at K=1 (free) and at K=32 (matched to PTRM's budget) ---
+    _mechanism = {
+        "i.i.d. noise (plain PTRM)": "fresh N(0,σ²) resampled into z_L every step",
+        "momentum (1st order)": "noise smoothed into a random walk (EMA) before injection",
+        "momentum (2nd order)": "noise smoothed twice (accelerating random walk) before injection",
+        "momentum + noise": "momentum drift + a smaller i.i.d. jitter layered on top",
+        "noise at init only": "z_H/z_L perturbed once at t=0, zero noise for the rest of the rollout",
+        "inertia (no noise)": "heavy-ball momentum on z_L's own update -- literally zero randomness",
+    }
+    _k_hi = int(noise_ablation_results["K"].max())
+
+    _rows = [dict(
+        method="TRM (deterministic)", mechanism="no noise, single pass",
+        compute="1×", selected_k1=noise_ablation_det_rate, selected_khi=noise_ablation_det_rate,
+        oracle_khi=noise_ablation_det_rate,
+    )]
+    for _label, _mech in _mechanism.items():
+        _r1 = noise_ablation_results[(noise_ablation_results["mode"] == _label) &
+                                      (noise_ablation_results["K"] == 1)].iloc[0]
+        _rhi = noise_ablation_results[(noise_ablation_results["mode"] == _label) &
+                                       (noise_ablation_results["K"] == _k_hi)].iloc[0]
+        _rows.append(dict(
+            method=_label, mechanism=_mech, compute="1×" if _label.startswith("inertia") else f"{_k_hi}×",
+            selected_k1=_r1["selected_rate"], selected_khi=_rhi["selected_rate"],
+            oracle_khi=_rhi["oracle_rate"],
+        ))
+
+    noise_method_comparison = pd.DataFrame(_rows).rename(columns={
+        "method": "method", "mechanism": "mechanism", "compute": "compute (vs. TRM)",
+        "selected_k1": "solve rate, K=1 (no extra compute)",
+        "selected_khi": f"solve rate, K={_k_hi} (Q-selected)",
+        "oracle_khi": f"oracle rate, K={_k_hi} (best-of-K)",
+    })
+    for _c in noise_method_comparison.columns:
+        if pd.api.types.is_float_dtype(noise_method_comparison[_c]):
+            noise_method_comparison[_c] = noise_method_comparison[_c].map(lambda _v: f"{_v:.0%}")
+    noise_method_comparison
+    return
+
+
+@app.cell(hide_code=True)
 def _(device, mo, np, os, pd, time, torch):
     # --- sudoku-extreme: EASY training slice + matched eval + a HARDER demo slice ---
     # Shared kernel: public names are distinct (Xtr/Ytr/Xev/Yev/Xhd/Yhd) to avoid sibling-notebook clashes.
